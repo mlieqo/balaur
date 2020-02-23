@@ -1,97 +1,128 @@
-import bencode
 import socket
-import urllib.parse
 import struct
 import random
-import hashlib
+import asyncio
+from torrent import Torrent
+from message import Handshake, UDPTrackerConnection
+
+
+t = Torrent.load_from_file('dark_waters.torrent')
+CONNECTION = (t.announce.hostname, t.announce.port)
 
 
 def main():
-    req_MESSAGE, transaction_id = create_conn_req()
+    udp_conn = UDPTrackerConnection()
+    msg = udp_conn.build_msg()
 
-    with open('ford.torrent', 'rb') as f:
-        torrent = bencode.decode(f.read())
-
-    import pprint
-    p = pprint.PrettyPrinter(indent=6)
-
-    torrent_announce = urllib.parse.urlparse(torrent['announce'])
-
-    CONNECTION = (torrent_announce.hostname,
-                  torrent_announce.port)
     connection_id = None
 
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while not connection_id:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP
-        sock.settimeout(1.0)
-        sock.sendto(req_MESSAGE, CONNECTION)
         try:
+            sock.settimeout(1.0)
+            sock.sendto(msg, CONNECTION)
             buf = sock.recvfrom(2048)[0]
-            connection_id = parse_conn_response(buf, transaction_id)
-        except socket.timeout:
-            print('REQUEST TIMED OUT')
+            connection_id = udp_conn.read(buf)
+        except:
+            pass
 
-    announce_res = create_announce_req(connection_id, port=777, torrent['info'])
-    print(connection_id)
+    #Annoucing
+    req, transaction_id = create_announce_req(connection_id)
+    yolo = None
+
+    while not yolo:
+        try:
+            sock.sendto(req, CONNECTION)
+            print("Announce Request Sent")
+            buf = sock.recvfrom(2048)[0]
+            print("Response received")
+            yolo = parse_announce_res(buf)
+        except:
+            pass
+    return yolo[1]
+    # peer_handshake(yolo[1])
 
 
-def create_conn_req():
-    connection_id = 0x41727101980  # default connection id
-    action = 0x0  # action (0 = give me a new connection id)
-    transaction_id = random.randrange(0, 255)  # randomized by client
-    buf = struct.pack("!q", connection_id)  # first 8 bytes is connection id
-    buf += struct.pack("!i", action)  # next 4 bytes is action
-    buf += struct.pack("!i", transaction_id)  # next 4 bytes is transaction id
-    return buf, transaction_id
+# def create_announce_req(connection_id):
+    # action = 0x1  # action (1 = announce)
+    # transaction_id = random.randrange(0, 255)
+    # buf = struct.pack("!Q", connection_id)  # first 8 bytes is connection id
+    # buf += struct.pack("!I", action)  # next 4 bytes is action
+    # buf += struct.pack("!I", transaction_id)  # followed by 4 byte transaction id
+    # buf += t.info_hash  # the info hash of the torrent we announce ourselves in
+    # buf += t.peer_id  # the peer_id we announce
+    # buf += struct.pack("!Q", 0)  # number of bytes downloaded
+    # buf += struct.pack("!Q", t.torrent_size)  # number of bytes left
+    # buf += struct.pack("!Q", 0)  # number of bytes uploaded
+    # buf += struct.pack("!I", 2)  # event 2 denotes start of downloading
+    # buf += struct.pack("!I", 0)  # IP address set to 0. Response received to the sender of this packet
+    # key = random.randrange(0, 255)  # Unique key randomized by client
+    # buf += struct.pack("!I", key)
+    # buf += struct.pack("!i", -1)  # Number of peers required. Set to -1 for default
+    # buf += struct.pack("!H", 6889)  # port on which response will be sent
+    # return buf, transaction_id
 
 
-def parse_conn_response(buffer, transaction_id):
-    action = struct.unpack_from("!i", buffer)[0]  # first 4 bytes is action
+def parse_announce_res(buf):
+    action, = struct.unpack(">I", buf[0:4])  # first 4 bytes is action
 
-    res_transaction_id = struct.unpack_from("!i", buffer, 4)[0]  # next 4 bytes is transaction id
-    if res_transaction_id != transaction_id:
-        raise RuntimeError(
-            "Transaction ID doesnt match in connection response!"
-            " Expected %s, got %s" % (transaction_id, res_transaction_id)
+    if action == 1:
+        ret = dict()
+        ret['action'] = action
+        res_transaction_id, = struct.unpack("!I", buf[4:8])  # next 4 bytes is transaction id
+        ret['transaction_id'] = res_transaction_id
+        ret['interval'], = struct.unpack("!I", buf[8:12])
+        ret['leeches'], = struct.unpack("!I", buf[12:16])
+        ret['seeds'], = struct.unpack("!I", buf[16:20])
+        peers = list()
+        x = 0
+        offset = 20
+        while offset != len(buf):
+
+            IP = struct.unpack_from("!I", buf, offset)[0]
+            IP = socket.inet_ntoa(struct.pack('!I', IP))
+            offset += 4
+            port = struct.unpack_from("!H", buf, offset)[0]
+            peers.append((IP, port))
+            offset += 2
+            x += 1
+        return ret, peers
+
+
+async def create_task_from_peer_list(peer_list):
+    tasks = []
+    for peer in peer_list:
+        task = asyncio.create_task(async_peer_handshake(peer))
+        tasks.append(task)
+    result = await asyncio.gather(*tasks, return_exceptions=True)
+
+    return result
+
+
+async def async_peer_handshake(peer):
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(*peer), timeout=0.5
         )
-    print(action)
-    print(res_transaction_id)
-    if action == 0:
-        connection_id = struct.unpack_from("!q", buffer, 8)[0]  # unpack 8 bytes from byte 8, should be the connection_id
-        return connection_id
-    elif action == 3:
-        error = struct.unpack_from("!s", buffer, 8)
-        raise RuntimeError("Error while trying to get a connection response: %s" % error)
+        handshake = Handshake(t.peer_id, t.info_hash)
+        msg = handshake.build_msg()
+        writer.write(msg)
+        print(f'handshake send {msg}')
+        await writer.drain()
 
+        data = await asyncio.wait_for(reader.read(4096), timeout=0.5)
+        if data:
+            print(f'received data {data}')
 
-def create_announce_req(connection_id, port, torrent_info):
-    action = 0x1  # action (1 = announce)
-    transaction_id = random.randrange(0, 255)
-    buf = struct.pack("!q", connection_id)  # first 8 bytes is connection id
-    buf += struct.pack("!i", action)  # next 4 bytes is action
-    buf += struct.pack("!i", transaction_id)  # followed by 4 byte transaction id
-    buf += struct.pack("!20s", info_hash(torrent_info))  # the info hash of the torrent we announce ourselves in
-    buf += struct.pack("!20s", peer_id())  # the peer_id we announce
-    buf += struct.pack("!q", int(urllib.unquote(payload['downloaded'])))  # number of bytes downloaded
-    buf += struct.pack("!q", int(urllib.unquote(payload['left'])))  # number of bytes left
-    buf += struct.pack("!q", int(urllib.unquote(payload['uploaded'])))  # number of bytes uploaded
-    buf += struct.pack("!i", 0x2)  # event 2 denotes start of downloading
-    buf += struct.pack("!i", 0x0)  # IP address set to 0. Response received to the sender of this packet
-    key = random.randrange(0, 255)  # Unique key randomized by client
-    buf += struct.pack("!i", key)
-    buf += struct.pack("!i", -1)  # Number of peers required. Set to -1 for default
-    buf += struct.pack("!i", s_port)  # port on which response will be sent
-    return (buf, transaction_id)
+        writer.close()
+        await writer.wait_closed()
 
-
-def peer_id():
-    return '-DV0001-'
-
-
-def info_hash(torrent_info):
-    info = bencode.encode(torrent_info)
-    return hashlib.sha1(b'%s' % info).hexdigest()
+    except Exception as e:
+        raise e
+    return True
 
 
 if __name__ == '__main__':
-    main()
+    peer_list = main()
+    result = asyncio.run(create_task_from_peer_list(peer_list))
+    print(len([x for x in result if x is True]))
