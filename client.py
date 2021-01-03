@@ -6,15 +6,6 @@ import peer
 import piece
 
 
-t = torrent.Torrent.load_from_file('condor.torrent')
-CONNECTION = (t.announce_list[2].hostname, t.announce_list[2].port)
-
-print(CONNECTION)
-import pprint
-p = pprint.PrettyPrinter(indent=6)
-blocks = []
-
-
 class TorrentClient:
     def __init__(self, torrent_: torrent.Torrent):
         self._peer_id = struct.pack('!20s', b'-DV0001-')

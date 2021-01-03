@@ -35,8 +35,11 @@ class PieceManager:
         return pieces
 
     def get_available_piece(self, bitfield=None):
+        # FIXME: slow
         for piece_ in self.pieces:
             if not piece_.downloaded and not piece_.queued:
+                if bitfield:
+                    print('there is bifield')
                 if bitfield is None or (bitfield is not None and bitfield[piece_.index]):
                     piece_.queued = True
                     return piece_
@@ -57,6 +60,7 @@ class Piece:
     def validate(self) -> None:
         if self._is_hash_correct():
             self.downloaded = True
+            print(f'Downloaded piece n. {self.index}')
         else:
             # we clear all blocks if piece is not valid
             for block in self.blocks:

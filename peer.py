@@ -1,8 +1,9 @@
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import asyncio
 import uuid
 import time
+import itertools
 
 import message
 import torrent
@@ -17,36 +18,44 @@ class PeerManager:
     """
 
     MAX_CONNECTIONS = 20
+    HANDSHAKE_DELAY = 120
 
     def __init__(self, torrent_: torrent.Torrent, peer_id: bytes, file_queue):
-        self._peers_lists: Optional[List[List['Peer']]] = None
+        self._peer_set: Optional[List[List['Peer']]] = None
         self._torrent = torrent_
         self._peer_id = peer_id
         self._workers = None
         self._file_queue = file_queue
+        self._handshaked_peers = set()
 
     async def start(self):
-        self._peers_lists = await self._get_peer_lists()
-        self._workers = [PeerWorker(self._peers_lists[0], self._peer_id, self._torrent.info_hash)
-                         for _ in range(self.MAX_CONNECTIONS)]
+        self._peer_set = await self._get_peer_set()
+        self._workers = [
+            PeerWorker(
+                self._peer_set,
+                self._handshaked_peers,
+                self._peer_id,
+                self._torrent.info_hash
+            )
+            for _ in range(self.MAX_CONNECTIONS)
+        ]
 
     async def run(self):
-        # spawn MAX_CONNECTIONS amount of workers that will have each their own peer
-        # and will take care of the whole lifecycle
-        # for i in range(self.MAX_CONNECTIONS):
-        await self.handshake_peers()
-        # await self.send_interested()
+        # we do initial handshake with peers and then we run it as a background job
+        print(f'peer set before handshake {self._peer_set}')
+        await self._handshake_peers()
+        asyncio.create_task(self._handshake_peers_loop())
         await asyncio.gather(*(worker.run() for worker in self._workers))
 
-    async def _get_peer_lists(self):
-        peer_lists = await asyncio.gather(
+    async def _get_peer_set(self):
+        peer_sets = await asyncio.gather(
             *(self._announce_request(x) for x in self._torrent.announce_list),
             # we return also exceptions as sometimes announce response comes with
             # negative connection id that causes exception 'int too large to convert'
             # when building announce request
-            return_exceptions=True
+            # return_exceptions=True
         )
-        return [x for x in peer_lists if isinstance(x, list)]
+        return set(itertools.chain.from_iterable(peer_sets))
 
     async def _announce_request(self, announce):
         _udp_tracker = udp_tracker.UDPTracker(
@@ -55,35 +64,48 @@ class PeerManager:
             self._peer_id,
             self._torrent
         )
-        try:
-            peers = await _udp_tracker.get_peer_list()
-        except asyncio.TimeoutError:
-            return None
-        peer_list = []
-        for ip, port in peers:
-            peer_list.append(Peer(ip=ip, port=port, peer_id=self._peer_id, file_queue=self._file_queue))
-        return peer_list
+        peer_object_set = set()
 
-    async def handshake_peers(self):
+        try:
+            peers = await _udp_tracker.get_peer_set()
+        except:
+            return peer_object_set
+
+        for ip, port in peers:
+            peer_object_set.add(Peer(ip=ip, port=port, peer_id=self._peer_id, file_queue=self._file_queue))
+        return peer_object_set
+
+    async def _handshake_peers_loop(self):
+        while True:
+            await asyncio.sleep(self.HANDSHAKE_DELAY)
+            print('running handshake peers from background')
+            await self._handshake_peers()
+
+    async def _handshake_peers(self):
         """
         Handshake all peers only at the beginning before download starts, then handshakes are
         done by peer worker.
         """
-        await asyncio.gather(
+        handshaked_peers = await asyncio.gather(
             *(
                 peer.make_handshake(self._peer_id, self._torrent.info_hash)
-                for peer in self._peers_lists[0]
+                for peer in self._peer_set
             ),
             return_exceptions=True
         )
+        print(f'handshaked peers after handshake {handshaked_peers}')
+        self._handshaked_peers |= set(peer for peer in handshaked_peers if isinstance(peer, Peer))
+        self._peer_set -= self._handshaked_peers
+        print(self._handshaked_peers)
 
 
 class PeerWorker:
-    def __init__(self, peers: List['Peer'], peer_id, info_hash):
+    def __init__(self, peers: Set['Peer'], handshaked_peers, peer_id, info_hash):
         self.peers = peers
         self._peer: Optional[Peer] = None
         self._info_hash = info_hash
         self._peer_id = peer_id
+        self._handshaked_peers: Set[Peer] = handshaked_peers
 
     async def run(self):
         while True:
@@ -93,10 +115,11 @@ class PeerWorker:
                 self._peer = await self._get_peer()
 
             if self._peer.choked:
-                if await self._peer.send_interested() is False:
-                    await self._run_piece_request_loop()
-                else:
+                if await self._peer.send_interested() is True:
                     self._peer = None
+                    continue
+
+            await self._run_piece_request_loop()
 
     async def _run_piece_request_loop(self):
         while True:
@@ -109,23 +132,15 @@ class PeerWorker:
             await asyncio.sleep(0)
 
     async def _get_peer(self):
-        for peer in self.peers:
-            if peer.is_available and peer.has_handshaked:
-                # self._peer = peer
+        while True:
+            try:
+                # TODO: there is also chance that the handshake is old
+                peer = self._handshaked_peers.pop()
+            except KeyError:
+                await asyncio.sleep(10)
+            else:
                 peer.is_available = False
                 return peer
-            # we wait until maybe one of the peers will be available
-            # TODO: maybe there is peer available but has not handshaked so we should try to handshake here again
-        print('inside get_peer loop')
-
-        while True:
-            for peer in self.peers:
-                if peer.is_available and not peer.has_handshaked:
-                    if peer.can_be_handshaked and await peer.make_handshake(self._peer_id, self._info_hash):
-                        peer.is_available = False
-                        self._peer = peer
-
-            await asyncio.sleep(Peer.MINIMUM_HANDSHAKE_DELAY)
 
 
 class Peer:
@@ -133,7 +148,7 @@ class Peer:
     Peer class implementation for communicating
     """
 
-    MINIMUM_HANDSHAKE_DELAY = 60
+    MINIMUM_HANDSHAKE_DELAY = 130
 
     def __init__(self, ip, port, peer_id, file_queue):
         self._id = uuid.uuid1()
@@ -155,6 +170,9 @@ class Peer:
         self._current_piece: Optional[piece.Piece] = None
         self.last_handshake = None
 
+    def __hash__(self):
+        return hash(f'{self._ip}{self._port}')
+
     async def make_handshake(self, peer_id: bytes, info_hash: bytes):
         handshake = message.Handshake(peer_id, info_hash)
         self.last_handshake = time.time()
@@ -163,13 +181,14 @@ class Peer:
         response = await self._protocol.send_message(handshake.to_bytes())
         processed_message = message.process_handshake_response(response)
 
-        if isinstance(processed_message[0], message.Handshake):
+        if processed_message is not None and isinstance(processed_message[0], message.Handshake):
             self._handshaked = True
             print('handshaked')
-        if len(processed_message) > 1 and isinstance(processed_message[1], message.BitField):
-            self._bitfield = processed_message[1].bitfield
+            if len(processed_message) > 1 and isinstance(processed_message[1], message.BitField):
+                self._bitfield = processed_message[1].bitfield
+            return self
 
-        return self._handshaked
+        return None
 
     @property
     def can_be_handshaked(self):
@@ -197,9 +216,13 @@ class Peer:
         if not self._current_piece:
             self._current_piece = self._piece_manager.get_available_piece(self._bitfield)
 
-        for block in self._current_piece.blocks:
+        current_block_number = 0
+        while current_block_number < len(self._current_piece.blocks):
+            block = self._current_piece.blocks[current_block_number]
             if block.data:
                 # skip already downloaded blocks
+                print('skipping block')
+                current_block_number += 1
                 continue
 
             request_message = message.Request().to_bytes(self._current_piece.index, block.offset)
@@ -211,9 +234,12 @@ class Peer:
 
             if isinstance((piece_message := message.process_message(response)), message.Piece):
                 block.data = piece_message.block_data
+                current_block_number += 1
             else:
-                # TODO: something should happend here if it's not piece :(
+                # TODO: maybe add some counter that checks how many times has peer send
+                # TODO: incorrect data so it won't be inifinite cycle?
                 pass
+
         else:
             # TODO: we should probably drop peer if he is sending non valid pieces?
             self._current_piece.validate()

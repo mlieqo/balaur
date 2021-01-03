@@ -1,10 +1,12 @@
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 import struct
 import random
 import socket
 import bitstring
 import attr
+
+import piece
 
 
 PSTRLEN = 19
@@ -35,8 +37,8 @@ def process_message(message: bytes):
         return
 
 
-def process_handshake_response(response: bytes):
-    if len(response) < Handshake.LENGTH:
+def process_handshake_response(response: Optional[bytes]):
+    if response is None or len(response) < Handshake.LENGTH:
         return
 
     handshake = Handshake.from_bytes(response)
@@ -136,7 +138,7 @@ class Request:
         message_id = struct.pack('!B', 6)
         index = struct.pack('!I', piece_index)
         begin = struct.pack('!I', block_offset)
-        block_length = struct.pack('!I', 2**14)
+        block_length = struct.pack('!I', piece.Block.LENGTH)
         return length + message_id + index + begin + block_length
 
     @classmethod
@@ -225,7 +227,7 @@ class UDPTrackerAnnounce:
             ret['interval'], = struct.unpack("!I", buffer[8:12])
             ret['leeches'], = struct.unpack("!I", buffer[12:16])
             ret['seeds'], = struct.unpack("!I", buffer[16:20])
-            peers = list()
+            peers = set()
             x = 0
             offset = 20
             while offset != len(buffer):
@@ -233,7 +235,7 @@ class UDPTrackerAnnounce:
                 ip = socket.inet_ntoa(struct.pack('!I', ip))
                 offset += 4
                 port = struct.unpack_from("!H", buffer, offset)[0]
-                peers.append((ip, port))
+                peers.add((ip, port))
                 offset += 2
                 x += 1
             return ret, peers

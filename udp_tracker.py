@@ -33,7 +33,7 @@ class UDPClientProtocol(asyncio.BaseProtocol):
 
 class UDPTracker:
     def __init__(self, ip, port, peer_id, torrent: Torrent):
-        self.peer_list = None
+        self.peer_set = None
         self.connection_id = None
         self.conn = (ip, port)
         self.peer_id = peer_id
@@ -42,10 +42,10 @@ class UDPTracker:
         self.udp_conn = UDPTrackerConnection()
         self.udp_announce = None
 
-    async def get_peer_list(self):
+    async def get_peer_set(self):
         await self._send_conn_req()
         await self._send_announce_req()
-        return self.peer_list
+        return self.peer_set
 
     async def _send_conn_req(self):
         buff = await self._udp_send_message(
@@ -67,8 +67,8 @@ class UDPTracker:
             self.udp_announce.build_msg(),
             self.conn
         )
-        ret, self.peer_list = self.udp_announce.read(buff)
-        return self.peer_list
+        ret, self.peer_set = self.udp_announce.read(buff)
+        return self.peer_set
 
     @staticmethod
     async def _udp_send_message(msg, addr, timeout=0.5):
