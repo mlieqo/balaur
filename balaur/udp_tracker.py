@@ -48,10 +48,7 @@ class UDPTracker:
         return self.peer_set
 
     async def _send_conn_req(self):
-        buff = await self._udp_send_message(
-            self.udp_conn.message,
-            self.conn
-        )
+        buff = await self._udp_send_message(self.udp_conn.message, self.conn)
         self.connection_id = self.udp_conn.read(buff)
         return self.connection_id
 
@@ -61,12 +58,9 @@ class UDPTracker:
                 connection_id=self.connection_id,
                 info_hash=self.info_hash,
                 torrent_size=self.torrent_size,
-                peer_id=self.peer_id
+                peer_id=self.peer_id,
             )
-        buff = await self._udp_send_message(
-            self.udp_announce.build_msg(),
-            self.conn
-        )
+        buff = await self._udp_send_message(self.udp_announce.build_msg(), self.conn)
         ret, self.peer_set = self.udp_announce.read(buff)
         return self.peer_set
 
@@ -75,9 +69,7 @@ class UDPTracker:
         loop = asyncio.get_running_loop()
         on_con_lost = loop.create_future()
         transport, protocol = await loop.create_datagram_endpoint(
-            lambda: UDPClientProtocol(msg, on_con_lost),
-            remote_addr=addr
+            lambda: UDPClientProtocol(msg, on_con_lost), remote_addr=addr
         )
         await asyncio.wait_for(on_con_lost, timeout)
         return protocol.data
-

@@ -1,24 +1,11 @@
-from typing import Callable, Any, Optional
+from typing import Optional
 
 import asyncio
 import logging
 
 
-logger = logging.getLogger(__name__)
-
-
-# def reconnect(func: Callable[..., Any]):
-#     async def wrapper(self, *args, **kwargs):
-#         try:
-#             return await func(self, *args, **kwargs)
-#         except (ConnectionResetError, AttributeError):
-#             try:
-#                 await self._connect()
-#             except ConnectionRefusedError:
-#                 print('inside connection refused')
-#                 return None
-#             return await func(self, *args, **kwargs)
-#     return wrapper
+class PeerUnavailableError(Exception):
+    pass
 
 
 class PeerProtocol:
@@ -28,29 +15,34 @@ class PeerProtocol:
         self._port = port
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader: Optional[asyncio.StreamReader] = None
+        self._logger = logging.getLogger(self.__class__.__name__)
 
-    async def _connect(self):
+    def is_opened(self):
+        return self._writer is not None and self._reader is not None
+
+    async def connect(self):
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._ip, self._port), timeout=3
             )
-        except asyncio.TimeoutError:
-            pass
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as exc:
+            raise PeerUnavailableError from exc
 
     async def send_message(self, message):
         try:
             self._writer.write(message)
             await self._writer.drain()
+        except (ConnectionRefusedError, ConnectionResetError) as e:
+            self._logger.error('Cannot write mesage = %s', e)
+        else:
             return await self._read_response()
-        except ConnectionRefusedError as e:
-            logger.error('Cannot write mesage = %s', e)
 
     async def _read_response(self):
         whole_response = b''
         while True:
             try:
                 response = await asyncio.wait_for(self._reader.read(4096), timeout=1.5)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, ConnectionResetError):
                 break
             else:
                 if not response:

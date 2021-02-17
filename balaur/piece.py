@@ -4,15 +4,15 @@ import hashlib
 import logging
 import cached_property
 
+import torrent
 
 logger = logging.getLogger(__name__)
 
 
 class PieceManager:
-
-    def __init__(self, piece_length, torrent):
-        self.piece_length = piece_length
+    def __init__(self, torrent: torrent.Torrent):
         self.torrent = torrent
+        self.piece_length = torrent.piece_length
         self.pieces: List[Piece] = self._init_pieces()
 
     def _init_pieces(self):
@@ -28,7 +28,9 @@ class PieceManager:
             pieces.append(
                 Piece(
                     index=piece_number,
-                    hash_=self.torrent.info['pieces'][hash_start_index:hash_start_index + Piece.HASH_LENGTH],
+                    hash_=self.torrent.info['pieces'][
+                        hash_start_index : hash_start_index + Piece.HASH_LENGTH
+                    ],
                     length=self.torrent.piece_length,
                 )
             )
@@ -40,7 +42,9 @@ class PieceManager:
             if not piece_.downloaded and not piece_.queued:
                 if bitfield:
                     print('there is bifield')
-                if bitfield is None or (bitfield is not None and bitfield[piece_.index]):
+                if bitfield is None or (
+                    bitfield is not None and bitfield[piece_.index]
+                ):
                     piece_.queued = True
                     return piece_
 
@@ -80,7 +84,7 @@ class Piece:
 
 class Block:
 
-    LENGTH = 2**14
+    LENGTH = 2 ** 14
 
     def __init__(self, index):
         self.index = index

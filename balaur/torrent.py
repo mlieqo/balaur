@@ -35,11 +35,7 @@ class Torrent:
         content = cls.open_torrent_file(filepath)
         announce = urlparse(content['announce'])
         announce_list = [urlparse(x[0]) for x in content['announce-list']]
-        return cls(
-            content,
-            announce,
-            announce_list
-        )
+        return cls(content, announce, announce_list)
 
     def load_from_magnet(self):
         pass
