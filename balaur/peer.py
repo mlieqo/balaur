@@ -3,18 +3,18 @@ from typing import List, Optional, Set
 import asyncio
 import uuid
 import itertools
-import logging
+
+import logwood
 
 import message
 import torrent
 import udp_tracker
-import protocols
+import protocol
 import piece
 
 
 class PeerManager:
-
-    MAX_CONNECTIONS = 20
+    MAX_CONNECTIONS = 50
     REFRESH_PEERS_DELAY = 120
 
     def __init__(self, torrent: torrent.Torrent, peer_id: bytes, file_queue):
@@ -24,28 +24,52 @@ class PeerManager:
         self._peer_id = peer_id
         self._file_queue = file_queue
         self._message_handler = message.MessageHandler()
+        self._trackers: Optional[List[udp_tracker.UDPTracker]] = None
         self._workers: Optional[List[PeerWorker]] = None
         self._active_peers_available: Optional[asyncio.Event] = None
         self._peer_refresh_task: Optional[asyncio.Task] = None
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logwood.get_logger(self.__class__.__name__)
 
     async def start(self):
+        """
+        Loads `self._trackers`, `self._peers` and initializes PeerWorker `self._workers`
+        based on `MAX_CONNECTIONS` amount.
+        """
+
+        # initialize event here, because `EventLoop` might have not been started yet during initialization
         self._active_peers_available = asyncio.Event()
+
+        # TODO: currently only udp trackers
+        self._trackers = [
+            udp_tracker.UDPTracker(
+                ip=announce.hostname,
+                port=announce.port,
+                peer_id=self._peer_id,
+                torrent=self._torrent,
+            )
+            for announce in self._torrent.announce_list
+            if announce.scheme == 'udp'
+        ]
+
         await self._load_peers()
 
         self._workers = [
             PeerWorker(
+                i,
                 self._peers,
                 self._active_peers,
                 self._peer_id,
                 self._torrent.info_hash,
                 self._active_peers_available,
             )
-            for _ in range(self.MAX_CONNECTIONS)
+            for i in range(self.MAX_CONNECTIONS)
         ]
 
-    async def run(self):
-        # we do initial handshake with peers and then we run it as a background job
+    async def run(self) -> None:
+        """
+        Does initial handshake with `self._peers`, then schedules `self._refresh_peers_loop` to run
+        every `REFRESH_PEERS_DELAY` and runs all workers in background
+        """
         await self._handshake_peers()
         self._peer_refresh_task = asyncio.create_task(self._refresh_peers_loop())
         await asyncio.gather(*(worker.run() for worker in self._workers))
@@ -55,40 +79,33 @@ class PeerManager:
         Send UDP announce request and get information about the current peers
         """
         peer_sets = await asyncio.gather(
-            *(self._announce_request(x) for x in self._torrent.announce_list),
+            *(self._get_peers(tracker) for tracker in self._trackers),
         )
         self._peers = set(itertools.chain.from_iterable(peer_sets))
 
-        # remove peers that we cannot create connection with
-
-    async def _announce_request(self, announce) -> Set['Peer']:
+    async def _get_peers(self, tracker: udp_tracker.UDPTracker) -> Set['Peer']:
         """
-        Helper method for sending udp announce requests, if there is any exception we
-        return just empty set, otherwise we initialize Peer objects
-
-        This is mostly wrapper so we can call asyncio.gather around it
+        Helper method for obtaining peers from tracker, used as a wrapper around
+        `tracker.get_peers` method for handling exceptions and creating a `Peer` objects
+        out of addresses.
         """
-        tracker = udp_tracker.UDPTracker(
-            announce.hostname, announce.port, self._peer_id, self._torrent
-        )
-
         peers = set()
+
         try:
-            peer_info = await tracker.get_peer_set()
-        except:
-            return peers
-
-        for ip, port in peer_info:
-            peers.add(
-                Peer(
-                    ip=ip,
-                    port=port,
-                    peer_id=self._peer_id,
-                    file_queue=self._file_queue,
-                    message_handler=self._message_handler,
+            peer_addresses = await tracker.get_peers()
+        except Exception as e:
+            self._logger.error('Error loading peers from tracker = %s: %s', tracker, e)
+        else:
+            for ip, port in peer_addresses:
+                peers.add(
+                    Peer(
+                        ip=ip,
+                        port=port,
+                        peer_id=self._peer_id,
+                        file_queue=self._file_queue,
+                        message_handler=self._message_handler,
+                    )
                 )
-            )
-
         return peers
 
     async def _refresh_peers_loop(self):
@@ -105,15 +122,17 @@ class PeerManager:
             peers_to_be_removed = set()
             for peer in self._peers:
                 if peer in self._active_peers:
-                    logging.debug('Removing already handshaked peer = %s', peer)
+                    self._logger.debug('Removing already handshaked peer = %s', peer)
                     peers_to_be_removed.add(peer)
             self._peers -= peers_to_be_removed
 
             await self._handshake_peers()
 
     async def _handshake_peers(self) -> None:
-        """"""
-        # first we need to establish connection
+        """
+        Creates TCP connection with peer, sends handshake and stores successfuly handshaked
+        peers in `self._active_peers`
+        """
 
         await asyncio.gather(*(peer.create_connection() for peer in self._peers))
         self._peers = set(peer for peer in self._peers if peer.is_opened)
@@ -131,15 +150,17 @@ class PeerManager:
 
 
 class PeerWorker:
-    def __init__(self, peers: Set['Peer'], handshaked_peers, peer_id, info_hash, test):
+    def __init__(
+        self, id, peers: Set['Peer'], handshaked_peers, peer_id, info_hash, test
+    ):
         self.peers = peers
-        self._id = uuid.uuid4()
+        self._id = id
         self._peer: Optional[Peer] = None
         self._info_hash = info_hash
         self._peer_id = peer_id
         self._handshaked_peers: Set[Peer] = handshaked_peers
         self._active_peers_available: asyncio.Event = test
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logwood.get_logger(self.__class__.__name__)
 
     async def run(self):
         while True:
@@ -148,6 +169,9 @@ class PeerWorker:
 
             if self._peer.choked:
                 if await self._peer.send_interested() is True:
+                    self._logger.info(
+                        'Worker[%s] - peer %s not interested', self._id, self._peer
+                    )
                     self._peer = None
                     continue
 
@@ -173,10 +197,10 @@ class PeerWorker:
             try:
                 await asyncio.wait_for(self._active_peers_available.wait(), None)
                 peer = self._handshaked_peers.pop()
-                self._logger.info(f'Worker acquired peer = {peer}')
+                self._logger.info('Worker[%s] acquired peer = %s', self._id, peer)
             except KeyError:
                 self._active_peers_available.clear()
-                # await asyncio.sleep(10)
+                self._logger.debug('No active peers available')
             else:
                 peer.is_available = False
                 return peer
@@ -201,8 +225,8 @@ class Peer:
         self.handshaked = False
         self.choked = True
         self.is_available = True
-        self._piece_manager = file_queue
-        self._protocol = protocols.PeerProtocol(
+        self._piece_manager: piece.PieceManager = file_queue
+        self._protocol = protocol.PeerProtocol(
             peer_id=self._peer_id,
             ip=self._ip,
             port=self._port,
@@ -226,7 +250,7 @@ class Peer:
     async def create_connection(self) -> None:
         try:
             await self._protocol.connect()
-        except protocols.PeerUnavailableError:
+        except protocol.PeerUnavailableError:
             return None
 
     async def make_handshake(self, peer_id: bytes, info_hash: bytes) -> None:

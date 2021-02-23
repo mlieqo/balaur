@@ -167,8 +167,8 @@ class MessageHandler:
     def __init__(self):
         self._logger = logging.getLogger(self.__class__.__name__)
 
-    def process_message(self, message: bytes) -> Optional[BaseMessage]:
-        if len(message) < self.MIN_MESSAGE_LENGTH:
+    def process_message(self, message: Optional[bytes]) -> Optional[BaseMessage]:
+        if message is None or len(message) < self.MIN_MESSAGE_LENGTH:
             return
 
         length, message_id = struct.unpack('!IB', message[0:5])
@@ -193,92 +193,3 @@ class MessageHandler:
             ):
                 messages.append(bitfield)
         return messages
-
-
-class UDPTrackerConnection:
-    def __init__(self):
-        self._transaction_id = random.randrange(0, 10000)
-        self.message = self._build_message()
-
-    def _build_message(self):
-        connection_id = struct.pack('!Q', 0x41727101980)
-        action = struct.pack("!I", 0)
-        transaction_id = struct.pack("!I", self._transaction_id)
-        buffer = connection_id + action + transaction_id
-        return buffer
-
-    def read(self, buffer):
-        (action,) = struct.unpack_from("!I", buffer)
-        (res_transaction_id,) = struct.unpack_from("!I", buffer, 4)
-        if res_transaction_id != self._transaction_id:
-            raise RuntimeError('tr id')
-        if action == 0:
-            (connection_id,) = struct.unpack_from("!q", buffer, 8)
-            return connection_id
-        else:
-            raise RuntimeError('wrong action')
-
-
-class UDPTrackerAnnounce:
-    def __init__(self, connection_id, info_hash, peer_id, torrent_size):
-        self.info_hash = info_hash
-        self.peer_id = peer_id
-        self.torrent_size = torrent_size
-        self.connection_id = connection_id
-        self.transaction_id = random.randrange(0, 10000)
-
-    def build_msg(self):
-        # self.connection_id = connection_id
-        connection_id = struct.pack('!Q', self.connection_id)
-        action = struct.pack('!I', 1)
-        transaction_id = struct.pack('!I', self.transaction_id)
-        downloaded = struct.pack('!Q', 0)
-        t_size = struct.pack('!Q', self.torrent_size)
-        uploaded = struct.pack('!Q', 0)
-        event = struct.pack('!I', 2)
-        ip = struct.pack('!I', 0)
-        key = struct.pack('!I', random.randrange(0, 255))
-        num_peers = struct.pack('!i', -1)
-        port = struct.pack('!H', 6889)
-        return (
-            connection_id
-            + action
-            + transaction_id
-            + self.info_hash
-            + self.peer_id
-            + downloaded
-            + t_size
-            + uploaded
-            + event
-            + ip
-            + key
-            + num_peers
-            + port
-        )
-
-    @staticmethod
-    def read(buffer):
-        (action,) = struct.unpack(">I", buffer[0:4])  # first 4 bytes is action
-
-        if action == 1:
-            ret = dict()
-            ret['action'] = action
-            (res_transaction_id,) = struct.unpack(
-                "!I", buffer[4:8]
-            )  # next 4 bytes is transaction id
-            ret['transaction_id'] = res_transaction_id
-            (ret['interval'],) = struct.unpack("!I", buffer[8:12])
-            (ret['leeches'],) = struct.unpack("!I", buffer[12:16])
-            (ret['seeds'],) = struct.unpack("!I", buffer[16:20])
-            peers = set()
-            x = 0
-            offset = 20
-            while offset != len(buffer):
-                ip = struct.unpack_from("!I", buffer, offset)[0]
-                ip = socket.inet_ntoa(struct.pack('!I', ip))
-                offset += 4
-                port = struct.unpack_from("!H", buffer, offset)[0]
-                peers.add((ip, port))
-                offset += 2
-                x += 1
-            return ret, peers

@@ -1,13 +1,13 @@
 import asyncio
 import struct
-import logging
+
+import logwood
+
+logwood.basic_config(level=logwood.DEBUG)
 
 import torrent
 import peer
 import piece
-
-
-logging.basicConfig(level=logging.DEBUG)
 
 
 class TorrentClient:
@@ -31,7 +31,7 @@ class TorrentClient:
 
 
 if __name__ == '__main__':
-    logger = logging.getLogger(__name__)
+    logger = logwood.get_logger(__name__)
     t = torrent.Torrent.load_from_file('judas.torrent')
     client = TorrentClient(torrent=t)
     asyncio.run(client.run())

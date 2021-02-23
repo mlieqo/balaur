@@ -1,7 +1,8 @@
 from typing import Optional
 
 import asyncio
-import logging
+
+import logwood
 
 
 class PeerUnavailableError(Exception):
@@ -15,7 +16,7 @@ class PeerProtocol:
         self._port = port
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader: Optional[asyncio.StreamReader] = None
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logwood.get_logger(self.__class__.__name__)
 
     def is_opened(self):
         return self._writer is not None and self._reader is not None
@@ -34,6 +35,7 @@ class PeerProtocol:
             await self._writer.drain()
         except (ConnectionRefusedError, ConnectionResetError) as e:
             self._logger.error('Cannot write mesage = %s', e)
+            return None
         else:
             return await self._read_response()
 
