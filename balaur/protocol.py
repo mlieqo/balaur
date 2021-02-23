@@ -43,11 +43,14 @@ class PeerProtocol:
         whole_response = b''
         while True:
             try:
-                response = await asyncio.wait_for(self._reader.read(4096), timeout=1.5)
+                response = await asyncio.wait_for(self._reader.read(4096), timeout=1)
             except (asyncio.TimeoutError, ConnectionResetError):
                 break
             else:
                 if not response:
                     break
                 whole_response += response
+                # if len(whole_response) == 16397 or len(whole_response) == 10253:
+                #     break
+
         return whole_response

@@ -1,19 +1,27 @@
-from typing import List
-
+from typing import List, Optional
+import dataclasses
 import hashlib
-import logging
+import math
+
+import bitstring
 import cached_property
+import logwood
 
 import torrent
 
-logger = logging.getLogger(__name__)
+
+logger = logwood.get_logger(__name__)
 
 
 class PieceManager:
     def __init__(self, torrent: torrent.Torrent):
-        self.torrent = torrent
-        self.piece_length = torrent.piece_length
-        self.pieces: List[Piece] = self._init_pieces()
+        self._torrent = torrent
+        self._piece_length = torrent.piece_length
+        # initialize empty bitfield
+        self._bitfield: bitstring.BitArray = bitstring.BitArray(
+            length=self._torrent.number_of_pieces
+        )
+        self._pieces: List[Piece] = self._init_pieces()
 
     def _init_pieces(self):
         """
@@ -23,70 +31,105 @@ class PieceManager:
         """
         pieces = []
 
-        for piece_number in range(self.torrent.number_of_pieces):
+        for piece_number in range(self._torrent.number_of_pieces):
             hash_start_index = piece_number * Piece.HASH_LENGTH
             pieces.append(
                 Piece(
                     index=piece_number,
-                    hash_=self.torrent.info['pieces'][
+                    piece_hash=self._torrent.info['pieces'][
                         hash_start_index : hash_start_index + Piece.HASH_LENGTH
                     ],
-                    length=self.torrent.piece_length,
+                    length=self._torrent.piece_length,
                 )
             )
         return pieces
 
-    def get_available_piece(self, bitfield=None):
-        # FIXME: slow
-        for piece_ in self.pieces:
-            if not piece_.downloaded and not piece_.queued:
-                if bitfield:
-                    print('there is bifield')
-                if bitfield is None or (
-                    bitfield is not None and bitfield[piece_.index]
-                ):
-                    piece_.queued = True
-                    return piece_
+    def get_available_piece(
+        self, peer_bitfield: bitstring.BitArray
+    ) -> Optional['Piece']:
+        for index, bit in enumerate(self._bitfield):
+            if not bit and peer_bitfield[index]:
+                # we invert bitfield, signaling that the piece index is either downloaded
+                # or being downloaded
+                self._bitfield.invert(index)
+                return self._pieces[index]
+
+    def return_piece_by_index(self, index: int) -> None:
+        self._bitfield.invert(index)
+
+    @property
+    def number_of_pieces(self):
+        return self._torrent.number_of_pieces
 
 
 class Piece:
 
     HASH_LENGTH = 20
 
-    def __init__(self, index, hash_, length):
+    def __init__(self, index: int, piece_hash, length: int):
         self.index = index
-        self.hash = hash_
-        self.length = length
-        self.downloaded = False
-        self.queued = False
-        self.blocks = [Block(index) for index in range(int(self.length / Block.LENGTH))]
+        self.block_index = 0
+        self._hash = piece_hash
+        self._length = length
+        self._blocks = [
+            Block(index)
+            for index in range(math.ceil(float(self._length / Block.LENGTH)))
+        ]
 
-    def validate(self) -> None:
-        if self._is_hash_correct():
-            self.downloaded = True
-            print(f'Downloaded piece n. {self.index}')
+    def add_block_data(self, data: bytes) -> bool:
+        """
+        Adds data to piece block. If all blocks were downladed, checks validity/hash of itself.
+        In case piece is valid return True, otherwise reset all block data and return False.
+        """
+
+        self._blocks[self.block_index].data = data
+
+        if self.block_index == self.block_count - 1:
+            # we downloaded all blocks for this piece
+            if self._is_hash_correct():
+                logger.info('Downloaded piece n. %d', self.index)
+                return True
+            else:
+                # we clear all blocks if piece is not valid
+                logger.debug('Piece n.%d not valid', self.index)
+                for block in self._blocks:
+                    block.data = None
+                self.block_index = 0
         else:
-            # we clear all blocks if piece is not valid
-            for block in self.blocks:
-                block.data = None
-        self.queued = False
+            self.block_index += 1
+
+        return False
+
+    @property
+    def current_block_offset(self):
+        return self.block_index * Block.LENGTH
+
+    @property
+    def current_block_length(self):
+        # if last block
+        if self.block_index == self.block_count - 1:
+            length = self._length - (self.block_count - 1) * Block.LENGTH
+            return length
+        return Block.LENGTH
 
     def _is_hash_correct(self):
         piece_data = b''
-        for block in self.blocks:
+        for block in self._blocks:
             piece_data += block.data
-        return self.hash == hashlib.sha1(piece_data).digest()
+        data_hash = hashlib.sha1(piece_data).digest()
+        return self._hash == data_hash
 
     @cached_property.cached_property
     def block_count(self):
-        return len(self.blocks)
+        return len(self._blocks)
 
 
+@dataclasses.dataclass
 class Block:
 
     LENGTH = 2 ** 14
 
-    def __init__(self, index):
+    def __init__(self, index: int):
         self.index = index
         self.offset = index * self.LENGTH
         self.data = None

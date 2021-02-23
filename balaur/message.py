@@ -117,12 +117,12 @@ class Request(BaseMessage):
     ID: ClassVar[int] = 6
 
     @staticmethod
-    def to_bytes(piece_index, block_offset) -> bytes:
+    def to_bytes(piece_index: int, block_offset: int, block_length: int) -> bytes:
         length = struct.pack('!I', 13)
         message_id = struct.pack('!B', 6)
         index = struct.pack('!I', piece_index)
         begin = struct.pack('!I', block_offset)
-        block_length = struct.pack('!I', piece.Block.LENGTH)
+        block_length = struct.pack('!I', block_length)
         return length + message_id + index + begin + block_length
 
     @classmethod
@@ -135,6 +135,8 @@ class Piece(BaseMessage):
 
     ID: ClassVar[int] = 7
 
+    payload_length: int = attr.ib()
+    message_id: int = attr.ib()
     index: int = attr.ib()
     block_offset: int = attr.ib()
     block_data: bytes = attr.ib()
@@ -145,10 +147,15 @@ class Piece(BaseMessage):
     @classmethod
     def from_bytes(cls, _: int, buffer: bytes) -> 'Piece':
         block_length = len(buffer) - 13
-        piece_index, block_offset, block_data = struct.unpack(
-            f'II{block_length}s', buffer[5 : 13 + block_length]
-        )
-        return cls(piece_index, block_offset, block_data)
+        (
+            payload_length,
+            message_id,
+            piece_index,
+            block_offset,
+            block_data,
+        ) = struct.unpack(f'!IBII{block_length}s', buffer[: 13 + block_length])
+
+        return cls(payload_length, message_id, piece_index, block_offset, block_data)
 
 
 class MessageHandler:
