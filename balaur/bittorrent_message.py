@@ -1,14 +1,9 @@
-from typing import ClassVar, Optional, List
+from typing import ClassVar, Optional
 
 import abc
 import attr
 import bitstring
-import logging
-import random
-import socket
 import struct
-
-import piece
 
 
 class BaseMessage(abc.ABC):
@@ -156,47 +151,3 @@ class Piece(BaseMessage):
         ) = struct.unpack(f'!IBII{block_length}s', buffer[: 13 + block_length])
 
         return cls(payload_length, message_id, piece_index, block_offset, block_data)
-
-
-class MessageHandler:
-
-    MIN_MESSAGE_LENGTH = 5
-
-    MESSAGE_TYPES = {
-        0: Choke,
-        1: Unchoke,
-        2: Interested,
-        5: BitField,
-        6: Request,
-        7: Piece,
-    }
-
-    def __init__(self):
-        self._logger = logging.getLogger(self.__class__.__name__)
-
-    def process_message(self, message: Optional[bytes]) -> Optional[BaseMessage]:
-        if message is None or len(message) < self.MIN_MESSAGE_LENGTH:
-            return
-
-        length, message_id = struct.unpack('!IB', message[0:5])
-        try:
-            return self.MESSAGE_TYPES[message_id].from_bytes(length, message)
-        except KeyError:
-            self._logger.error('Unknown message id = %s', message_id)
-            return
-
-    def process_handshake(self, response: Optional[bytes]) -> Optional[List]:
-        """ Individual handle for handshake as it's different from other messages """
-        if response is None or len(response) < Handshake.LENGTH:
-            return
-
-        messages = [Handshake.from_bytes(response)]
-
-        # peers sometimes send also bitfield together with handshake
-        if len(response) > Handshake.LENGTH:
-            if isinstance(
-                (bitfield := self.process_message(response[Handshake.LENGTH :])),
-                BitField,
-            ):
-                messages.append(bitfield)
-        return messages

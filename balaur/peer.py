@@ -1,5 +1,4 @@
 from typing import List, Optional, Set
-
 import asyncio
 import bitstring
 import itertools
@@ -7,9 +6,10 @@ import uuid
 
 import logwood
 
-import message
+import bittorrent_message
 import torrent
 import udp_tracker
+import message_parser
 import protocol
 import piece
 
@@ -24,7 +24,8 @@ class PeerManager:
         self._torrent = torrent
         self._peer_id = peer_id
         self._file_queue = file_queue
-        self._message_handler = message.MessageHandler()
+        # single instance of parser is shared between all peers
+        self._parser = message_parser.Parser()
         self._trackers: Optional[List[udp_tracker.UDPTracker]] = None
         self._workers: Optional[List[PeerWorker]] = None
         self._active_peers_available: Optional[asyncio.Event] = None
@@ -103,7 +104,7 @@ class PeerManager:
                         port=port,
                         peer_id=self._peer_id,
                         file_queue=self._file_queue,
-                        message_handler=self._message_handler,
+                        parser=self._parser,
                     )
                 )
         return peers
@@ -135,7 +136,7 @@ class PeerManager:
         """
 
         await asyncio.gather(*(peer.create_connection() for peer in self._peers))
-        self._peers = set(peer for peer in self._peers if peer.is_opened)
+        self._peers = set(peer for peer in self._peers if peer.is_connected)
 
         await asyncio.gather(
             *(
@@ -244,23 +245,23 @@ class Peer:
 
     MINIMUM_HANDSHAKE_DELAY = 130
 
-    def __init__(self, ip, port, peer_id, file_queue, message_handler):
+    def __init__(self, ip, port, peer_id, file_queue, parser):
         self._id = uuid.uuid1()
         self._ip = ip
         self._peer_id = peer_id
         self._port = port
-        self._message_handler = message_handler
+        self._parser = parser
         self._bitfield: Optional[bitstring.BitArray] = None
-        self.handshaked = False
-        self.choked = True
         self._piece_manager: piece.PieceManager = file_queue
         self._protocol = protocol.PeerProtocol(
             peer_id=self._peer_id,
             ip=self._ip,
             port=self._port,
+            parser=parser,
         )
         self._current_piece: Optional[piece.Piece] = None
-        self.last_handshake = None
+        self.handshaked = False
+        self.choked = True
 
     def __str__(self):
         return f'Peer[{self._id}] - <{self._ip}:{self._port}>'
@@ -272,8 +273,8 @@ class Peer:
         return hash(f'{self._ip}{self._port}')
 
     @property
-    def is_opened(self):
-        return self._protocol.is_opened()
+    def is_connected(self):
+        return self._protocol.is_opened
 
     async def create_connection(self) -> None:
         try:
@@ -283,15 +284,14 @@ class Peer:
 
     async def make_handshake(self, peer_id: bytes, info_hash: bytes) -> None:
 
-        handshake = message.Handshake.to_bytes(peer_id, info_hash)
+        handshake = bittorrent_message.Handshake.to_bytes(peer_id, info_hash)
 
-        response = await self._protocol.send_message(handshake)
-        messages = self._message_handler.process_handshake(response)
+        parsed_messages = await self._protocol.send_handshake(handshake)
 
-        if messages is not None:
+        if parsed_messages is not None:
             self.handshaked = True
             try:
-                self._bitfield = messages[1].bitfield
+                self._bitfield = parsed_messages[1].bitfield
             except IndexError:
                 # in case peer has not send bitfield, we just assume he has all the pieces
                 self._bitfield = bitstring.BitArray(
@@ -299,10 +299,12 @@ class Peer:
                 )
 
     async def send_interested(self) -> bool:
-        response = await self._protocol.send_message(message.Interested.to_bytes())
+        parsed_message = await self._protocol.send_message(
+            bittorrent_message.Interested.to_bytes()
+        )
 
         # we don't really care for any other response than Unchoked
-        if isinstance(self._message_handler.process_message(response), message.Unchoke):
+        if isinstance(parsed_message, bittorrent_message.Unchoke):
             self.choked = False
 
         return self.choked
@@ -314,23 +316,23 @@ class Peer:
             )
 
         while self._current_piece:
-            request_message = message.Request().to_bytes(
+            request_message = bittorrent_message.Request.to_bytes(
                 self._current_piece.index,
                 self._current_piece.current_block_offset,
                 self._current_piece.current_block_length,
             )
-            response = await self._protocol.send_message(request_message)
-            if not response:
+            parsed_message = await self._protocol.send_message(request_message)
+            if parsed_message is None:
                 # let piece manager know that piece is not being downloaded anymore
                 self._piece_manager.return_piece_by_index(self._current_piece.index)
                 self._current_piece = None
                 raise PeerResponseError
 
-            if isinstance(
-                (piece_message := self._message_handler.process_message(response)),
-                message.Piece,
-            ):
-                if self._current_piece.add_block_data(piece_message.block_data) is True:
+            if isinstance(parsed_message, bittorrent_message.Piece):
+                if (
+                    self._current_piece.add_block_data(parsed_message.block_data)
+                    is True
+                ):
                     self._current_piece = None
 
 

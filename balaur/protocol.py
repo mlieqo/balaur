@@ -1,27 +1,38 @@
-from typing import Optional
-
+from typing import Optional, List
 import asyncio
 
 import logwood
 
+import bittorrent_message
+
 
 class PeerUnavailableError(Exception):
-    pass
+    """ Unable to connect or send bytes to peer """
 
 
 class PeerProtocol:
-    def __init__(self, peer_id, ip, port):
+    """
+    Protocol class for communicating with peers. Received raw data
+    is processed and parsed into `bittorrent_message`.
+    """
+
+    RESPONSE_TIMEOUT = 1.5
+    READ_BUFFER = 4096
+
+    def __init__(self, peer_id, ip, port, parser):
         self._peer_id = peer_id
         self._ip = ip
         self._port = port
+        self._parser = parser
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader: Optional[asyncio.StreamReader] = None
         self._logger = logwood.get_logger(self.__class__.__name__)
 
-    def is_opened(self):
+    @property
+    def is_opened(self) -> bool:
         return self._writer is not None and self._reader is not None
 
-    async def connect(self):
+    async def connect(self) -> None:
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._ip, self._port), timeout=3
@@ -29,28 +40,60 @@ class PeerProtocol:
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as exc:
             raise PeerUnavailableError from exc
 
-    async def send_message(self, message):
+    async def _send_bytes(self, data: bytes) -> None:
         try:
-            self._writer.write(message)
+            self._writer.write(data)
             await self._writer.drain()
         except (ConnectionRefusedError, ConnectionResetError) as e:
-            self._logger.error('Cannot write mesage = %s', e)
+            self._logger.error('Cannot write message = %s', e)
+            raise PeerUnavailableError from e
+
+    async def send_handshake(self, handshake: bytes) -> Optional[List]:
+        try:
+            await self._send_bytes(handshake)
+        except PeerUnavailableError:
             return None
         else:
-            return await self._read_response()
+            data = b''
+            while True:
+                try:
+                    response = await asyncio.wait_for(
+                        self._reader.read(self.READ_BUFFER), timeout=self.RESPONSE_TIMEOUT
+                    )
+                except (asyncio.TimeoutError, ConnectionResetError):
+                    break
+                else:
+                    if not response:
+                        break
+                    data += response
+            return self._parser.process_handshake(data)
 
-    async def _read_response(self):
-        whole_response = b''
+    async def send_message(self, message: bytes) -> Optional[bittorrent_message.BaseMessage]:
+        try:
+            await self._send_bytes(message)
+        except PeerUnavailableError:
+            return None
+        else:
+            return await self._read_and_parse_response()
+
+    async def _read_and_parse_response(
+        self,
+    ) -> Optional[bittorrent_message.BaseMessage]:
+        data = b''
         while True:
             try:
-                response = await asyncio.wait_for(self._reader.read(4096), timeout=1)
+                response = await asyncio.wait_for(self._reader.read(self.READ_BUFFER), timeout=self.RESPONSE_TIMEOUT)
             except (asyncio.TimeoutError, ConnectionResetError):
-                break
+                return None
             else:
                 if not response:
-                    break
-                whole_response += response
-                # if len(whole_response) == 16397 or len(whole_response) == 10253:
-                #     break
-
-        return whole_response
+                    return None
+                if not data:
+                    # it's first message we received from peer, we read message length
+                    # so we know when we received the full message
+                    message_length = (
+                        self._parser.get_length(response) + 4
+                    )  # 4 bytes are the length information
+                data += response
+                if len(data) >= message_length:
+                    return self._parser.process_message(data[:message_length])
