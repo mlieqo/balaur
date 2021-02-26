@@ -1,35 +1,43 @@
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Callable
 import asyncio
 import bitstring
+import contextlib
 import itertools
 import uuid
 
 import logwood
 
-import bittorrent_message
-import torrent
-import udp_tracker
-import message_parser
-import protocol
-import piece
+import balaur.bittorrent_message
+import balaur.torrent
+import balaur.udp_tracker
+import balaur.message_parser
+import balaur.protocol
+import balaur.piece
 
 
 class PeerManager:
     MAX_CONNECTIONS = 50
     REFRESH_PEERS_DELAY = 120
 
-    def __init__(self, torrent: torrent.Torrent, peer_id: bytes, file_queue):
+    def __init__(
+        self,
+        torrent: balaur.torrent.Torrent,
+        peer_id: bytes,
+        piece_manager: balaur.piece.PieceManager,
+    ):
         self._peers: Optional[Set['Peer']] = None
         self._active_peers = set()
         self._torrent = torrent
         self._peer_id = peer_id
-        self._file_queue = file_queue
+        self._piece_manager = piece_manager
         # single instance of parser is shared between all peers
-        self._parser = message_parser.Parser()
-        self._trackers: Optional[List[udp_tracker.UDPTracker]] = None
+        self._parser = balaur.message_parser.Parser()
+        self._trackers: Optional[List[balaur.udp_tracker.UDPTracker]] = None
         self._workers: Optional[List[PeerWorker]] = None
+        self._worker_tasks: Optional[List[asyncio.Task]] = None
         self._active_peers_available: Optional[asyncio.Event] = None
         self._peer_refresh_task: Optional[asyncio.Task] = None
+        self._download_finished: Optional[asyncio.Future] = None
         self._logger = logwood.get_logger(self.__class__.__name__)
 
     async def start(self) -> None:
@@ -38,12 +46,13 @@ class PeerManager:
         based on `MAX_CONNECTIONS` amount.
         """
 
-        # initialize event here, because `EventLoop` might have not been started yet during initialization
+        # initialize here, because `EventLoop` might have not been started yet during `__init__`
         self._active_peers_available = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        self._download_finished = loop.create_future()
 
-        # TODO: currently only udp trackers
         self._trackers = [
-            udp_tracker.UDPTracker(
+            balaur.udp_tracker.UDPTracker(
                 ip=announce.hostname,
                 port=announce.port,
                 peer_id=self._peer_id,
@@ -62,6 +71,7 @@ class PeerManager:
                 peer_id=self._peer_id,
                 info_hash=self._torrent.info_hash,
                 active_peers_available=self._active_peers_available,
+                on_finished_download=self._on_finished_download,
             )
             for i in range(self.MAX_CONNECTIONS)
         ]
@@ -73,7 +83,25 @@ class PeerManager:
         """
         await self._handshake_peers()
         self._peer_refresh_task = asyncio.create_task(self._refresh_peers_loop())
-        await asyncio.gather(*(worker.run() for worker in self._workers))
+        # worker_tasks = asyncio.create_task(asyncio.gather(*(worker.run() for worker in self._workers)))
+        self._worker_tasks = [
+            asyncio.create_task(worker.run()) for worker in self._workers
+        ]
+        # all workers have returned so we can stop running all background tasks
+        await self._download_finished
+        await self._stop()
+
+    async def _stop(self):
+        for worker_task in self._worker_tasks:
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+        self._peer_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._peer_refresh_task
+
+    def _on_finished_download(self):
+        self._download_finished.set_result(True)
 
     async def _load_peers(self) -> None:
         """
@@ -84,7 +112,7 @@ class PeerManager:
         )
         self._peers = set(itertools.chain.from_iterable(peer_sets))
 
-    async def _get_peers(self, tracker: udp_tracker.UDPTracker) -> Set['Peer']:
+    async def _get_peers(self, tracker: balaur.udp_tracker.UDPTracker) -> Set['Peer']:
         """
         Helper method for obtaining peers from tracker, used as a wrapper around
         `tracker.get_peers` method for handling exceptions and creating a `Peer` objects
@@ -103,7 +131,7 @@ class PeerManager:
                         ip=ip,
                         port=port,
                         peer_id=self._peer_id,
-                        file_queue=self._file_queue,
+                        piece_manager=self._piece_manager,
                         parser=self._parser,
                     )
                 )
@@ -166,6 +194,7 @@ class PeerWorker:
         peer_id: bytes,
         info_hash: bytes,
         active_peers_available: asyncio.Event,
+        on_finished_download: Callable[[], None],
     ):
         self._id = id
         self._peer: Optional[Peer] = None
@@ -173,6 +202,7 @@ class PeerWorker:
         self._peer_id = peer_id
         self._active_peers = active_peers
         self._active_peers_available: asyncio.Event = active_peers_available
+        self._on_finished_download = on_finished_download
         self._logger = logwood.get_logger(self.__class__.__name__)
 
     async def run(self) -> None:
@@ -192,8 +222,11 @@ class PeerWorker:
                     )
                     self._peer = None
                     continue
-
-            await self._run_piece_request_loop()
+            try:
+                await self._run_piece_request_loop()
+            except balaur.piece.NoAvailablePieces:
+                self._on_finished_download()
+                return
 
     async def _run_piece_request_loop(self) -> None:
         """
@@ -245,21 +278,23 @@ class Peer:
 
     MINIMUM_HANDSHAKE_DELAY = 130
 
-    def __init__(self, ip, port, peer_id, file_queue, parser):
+    TRY_GET_PIECE_DELAY = 3
+
+    def __init__(self, ip, port, peer_id, piece_manager, parser):
         self._id = uuid.uuid1()
         self._ip = ip
         self._peer_id = peer_id
         self._port = port
         self._parser = parser
         self._bitfield: Optional[bitstring.BitArray] = None
-        self._piece_manager: piece.PieceManager = file_queue
-        self._protocol = protocol.PeerProtocol(
+        self._piece_manager: balaur.piece.PieceManager = piece_manager
+        self._protocol = balaur.protocol.PeerProtocol(
             peer_id=self._peer_id,
             ip=self._ip,
             port=self._port,
             parser=parser,
         )
-        self._current_piece: Optional[piece.Piece] = None
+        self._current_piece: Optional[balaur.piece.Piece] = None
         self.handshaked = False
         self.choked = True
 
@@ -272,6 +307,9 @@ class Peer:
     def __hash__(self):
         return hash(f'{self._ip}{self._port}')
 
+    def __eq__(self, other):
+        return hash(self) == hash(other)
+
     @property
     def is_connected(self):
         return self._protocol.is_opened
@@ -279,12 +317,12 @@ class Peer:
     async def create_connection(self) -> None:
         try:
             await self._protocol.connect()
-        except protocol.PeerUnavailableError:
+        except balaur.protocol.PeerUnavailableError:
             return None
 
     async def make_handshake(self, peer_id: bytes, info_hash: bytes) -> None:
 
-        handshake = bittorrent_message.Handshake.to_bytes(peer_id, info_hash)
+        handshake = balaur.bittorrent_message.Handshake.to_bytes(peer_id, info_hash)
 
         parsed_messages = await self._protocol.send_handshake(handshake)
 
@@ -300,40 +338,54 @@ class Peer:
 
     async def send_interested(self) -> bool:
         parsed_message = await self._protocol.send_message(
-            bittorrent_message.Interested.to_bytes()
+            balaur.bittorrent_message.Interested.to_bytes()
         )
 
         # we don't really care for any other response than Unchoked
-        if isinstance(parsed_message, bittorrent_message.Unchoke):
+        if isinstance(parsed_message, balaur.bittorrent_message.Unchoke):
             self.choked = False
 
         return self.choked
 
     async def download_piece(self):
-        if not self._current_piece:
+        while not self._current_piece:
             self._current_piece = self._piece_manager.get_available_piece(
                 self._bitfield
             )
+            # TODO: maybe there are pieces but not for this peer
+            if self._current_piece is None:
+                # all pieces are currently taken or downloaded so we sleep
+                await asyncio.sleep(self.TRY_GET_PIECE_DELAY)
 
         while self._current_piece:
-            request_message = bittorrent_message.Request.to_bytes(
+            request_message = balaur.bittorrent_message.Request.to_bytes(
                 self._current_piece.index,
                 self._current_piece.current_block_offset,
                 self._current_piece.current_block_length,
             )
-            parsed_message = await self._protocol.send_message(request_message)
+            try:
+                parsed_message = await self._protocol.send_message(request_message)
+            except balaur.protocol.PeerUnavailableError:
+                self._piece_manager.return_piece_by_index(self._current_piece.index)
+                self._current_piece = None
+                raise
+
             if parsed_message is None:
                 # let piece manager know that piece is not being downloaded anymore
                 self._piece_manager.return_piece_by_index(self._current_piece.index)
                 self._current_piece = None
                 raise PeerResponseError
 
-            if isinstance(parsed_message, bittorrent_message.Piece):
-                if (
-                    self._current_piece.add_block_data(parsed_message.block_data)
-                    is True
-                ):
-                    self._current_piece = None
+            if isinstance(parsed_message, balaur.bittorrent_message.Piece):
+                if self._current_piece.add_block_data(parsed_message.block_data):
+                    if self._piece_manager.validate_piece(self._current_piece):
+                        self._current_piece = None
+                    else:
+                        self._piece_manager.return_piece_by_index(
+                            self._current_piece.index
+                        )
+                        self._current_piece = None
+                        raise PeerResponseError
 
 
 class PeerResponseError(Exception):

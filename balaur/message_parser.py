@@ -2,7 +2,7 @@ from typing import Optional, List
 import logwood
 import struct
 
-import bittorrent_message
+import balaur.bittorrent_message
 
 
 class Parser:
@@ -14,12 +14,12 @@ class Parser:
     MIN_MESSAGE_LENGTH = 5
 
     MESSAGE_TYPES = {
-        0: bittorrent_message.Choke,
-        1: bittorrent_message.Unchoke,
-        2: bittorrent_message.Interested,
-        5: bittorrent_message.BitField,
-        6: bittorrent_message.Request,
-        7: bittorrent_message.Piece,
+        0: balaur.bittorrent_message.Choke,
+        1: balaur.bittorrent_message.Unchoke,
+        2: balaur.bittorrent_message.Interested,
+        5: balaur.bittorrent_message.BitField,
+        6: balaur.bittorrent_message.Request,
+        7: balaur.bittorrent_message.Piece,
     }
 
     def __init__(self):
@@ -35,7 +35,7 @@ class Parser:
 
     def process_message(
         self, message: Optional[bytes]
-    ) -> Optional[bittorrent_message.BaseMessage]:
+    ) -> Optional[balaur.bittorrent_message.BaseMessage]:
         """
         Process messages based on their ID
         """
@@ -62,20 +62,20 @@ class Parser:
         Process handshake message. It's possible that peers will send bitfield message
         right after the handshake, so we return here List of messages.
         """
-        if len(response) < bittorrent_message.Handshake.LENGTH:
+        if len(response) < balaur.bittorrent_message.Handshake.LENGTH:
             return
 
-        messages = [bittorrent_message.Handshake.from_bytes(response)]
+        messages = [balaur.bittorrent_message.Handshake.from_bytes(response)]
 
         # peers sometimes send also bitfield together with handshake
-        if len(response) > bittorrent_message.Handshake.LENGTH:
+        if len(response) > balaur.bittorrent_message.Handshake.LENGTH:
             if isinstance(
                 (
                     bitfield := self.process_message(
-                        response[bittorrent_message.Handshake.LENGTH :]
+                        response[balaur.bittorrent_message.Handshake.LENGTH :]
                     )
                 ),
-                bittorrent_message.BitField,
+                balaur.bittorrent_message.BitField,
             ):
                 messages.append(bitfield)
         return messages

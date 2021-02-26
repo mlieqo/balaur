@@ -3,7 +3,7 @@ import asyncio
 
 import logwood
 
-import bittorrent_message
+import balaur.bittorrent_message
 
 
 class PeerUnavailableError(Exception):
@@ -44,7 +44,7 @@ class PeerProtocol:
         try:
             self._writer.write(data)
             await self._writer.drain()
-        except (ConnectionRefusedError, ConnectionResetError) as e:
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError) as e:
             self._logger.error('Cannot write message = %s', e)
             raise PeerUnavailableError from e
 
@@ -58,7 +58,8 @@ class PeerProtocol:
             while True:
                 try:
                     response = await asyncio.wait_for(
-                        self._reader.read(self.READ_BUFFER), timeout=self.RESPONSE_TIMEOUT
+                        self._reader.read(self.READ_BUFFER),
+                        timeout=self.RESPONSE_TIMEOUT,
                     )
                 except (asyncio.TimeoutError, ConnectionResetError):
                     break
@@ -68,7 +69,9 @@ class PeerProtocol:
                     data += response
             return self._parser.process_handshake(data)
 
-    async def send_message(self, message: bytes) -> Optional[bittorrent_message.BaseMessage]:
+    async def send_message(
+        self, message: bytes
+    ) -> Optional[balaur.bittorrent_message.BaseMessage]:
         try:
             await self._send_bytes(message)
         except PeerUnavailableError:
@@ -78,11 +81,13 @@ class PeerProtocol:
 
     async def _read_and_parse_response(
         self,
-    ) -> Optional[bittorrent_message.BaseMessage]:
+    ) -> Optional[balaur.bittorrent_message.BaseMessage]:
         data = b''
         while True:
             try:
-                response = await asyncio.wait_for(self._reader.read(self.READ_BUFFER), timeout=self.RESPONSE_TIMEOUT)
+                response = await asyncio.wait_for(
+                    self._reader.read(self.READ_BUFFER), timeout=self.RESPONSE_TIMEOUT
+                )
             except (asyncio.TimeoutError, ConnectionResetError):
                 return None
             else:
@@ -91,6 +96,9 @@ class PeerProtocol:
                 if not data:
                     # it's first message we received from peer, we read message length
                     # so we know when we received the full message
+                    if len(response) < 4:
+                        return None
+
                     message_length = (
                         self._parser.get_length(response) + 4
                     )  # 4 bytes are the length information

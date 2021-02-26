@@ -6,7 +6,7 @@ import struct
 
 import logwood
 
-import torrent
+import balaur.torrent
 
 
 logger = logwood.get_logger(__name__)
@@ -21,7 +21,9 @@ class UDPTracker:
 
     REQUEST_TIMEOUT = 5  # seconds
 
-    def __init__(self, ip: str, port: int, peer_id: bytes, torrent: torrent.Torrent):
+    def __init__(
+        self, ip: str, port: int, peer_id: bytes, torrent: balaur.torrent.Torrent
+    ):
         self._address = (ip, port)
         self._peer_id = peer_id
         self._info_hash = torrent.info_hash

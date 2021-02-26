@@ -1,21 +1,22 @@
-import asyncio
 import struct
 
 import logwood
 
 logwood.basic_config(level=logwood.DEBUG)
 
-import torrent
-import peer
-import piece
+import balaur.torrent
+import balaur.peer
+import balaur.piece
 
 
 class TorrentClient:
-    def __init__(self, torrent: torrent.Torrent):
+    def __init__(self, torrent_file: str, destination: str):
         self._peer_id = struct.pack('!20s', b'-DV0001-')
-        self._torrent = torrent
-        self._piece_manager = piece.PieceManager(torrent=torrent)
-        self._peer_manager = peer.PeerManager(
+        self._torrent = balaur.torrent.Torrent.load_from_file(torrent_file)
+        self._piece_manager = balaur.piece.PieceManager(
+            torrent=self._torrent, destination_directory=destination
+        )
+        self._peer_manager = balaur.peer.PeerManager(
             self._torrent, self._peer_id, self._piece_manager
         )
 
@@ -28,10 +29,3 @@ class TorrentClient:
 
     async def stop(self):
         pass
-
-
-if __name__ == '__main__':
-    logger = logwood.get_logger(__name__)
-    t = torrent.Torrent.load_from_file('judas.torrent')
-    client = TorrentClient(torrent=t)
-    asyncio.run(client.run())
