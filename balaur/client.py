@@ -4,9 +4,9 @@ import logwood
 
 logwood.basic_config(level=logwood.DEBUG)
 
-import balaur.torrent
-import balaur.peer
-import balaur.piece
+import balaur.torrent  # noqa
+import balaur.peer  # noqa
+import balaur.piece  # noqa
 
 
 class TorrentClient:
