@@ -33,6 +33,9 @@ class PeerProtocol:
         return self._writer is not None and self._reader is not None
 
     async def connect(self) -> None:
+        """
+        Establish network connection with `self._ip` and `self._port` address
+        """
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._ip, self._port), timeout=3
@@ -41,6 +44,11 @@ class PeerProtocol:
             raise PeerUnavailableError from exc
 
     async def _send_bytes(self, data: bytes) -> None:
+        """
+        Sends `data` bytes through the established network connection
+
+        Raises `PeerUnavailableError` if the connection is broken.
+        """
         try:
             self._writer.write(data)
             await self._writer.drain()
@@ -49,6 +57,9 @@ class PeerProtocol:
             raise PeerUnavailableError from e
 
     async def send_handshake(self, handshake: bytes) -> Optional[List]:
+        """
+        Sends handshake message bytes and then immediately read and parse response.
+        """
         try:
             await self._send_bytes(handshake)
         except PeerUnavailableError:
@@ -72,6 +83,9 @@ class PeerProtocol:
     async def send_message(
         self, message: bytes
     ) -> Optional[balaur.bittorrent_message.BaseMessage]:
+        """
+        Sends message, then reads and parses the response.
+        """
         try:
             await self._send_bytes(message)
         except PeerUnavailableError:
@@ -82,6 +96,10 @@ class PeerProtocol:
     async def _read_and_parse_response(
         self,
     ) -> Optional[balaur.bittorrent_message.BaseMessage]:
+        """
+        Reads response until whole message has been received and then tries to parse it.
+        The length of message is indicated by the first 4 bytes of the message.
+        """
         data = b''
         while True:
             try:
