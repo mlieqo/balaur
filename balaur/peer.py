@@ -102,6 +102,7 @@ class PeerManager:
         """
         Cancel all of the background tasks.
         """
+
         async def stop_task(task: asyncio.Task) -> None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
