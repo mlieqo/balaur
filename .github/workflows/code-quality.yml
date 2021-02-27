@@ -24,3 +24,6 @@ jobs:
     - name: Check black format
       run: |
         black . --skip-string-normalization --check
+    - name: Check flake8
+      run: |
+        flake8 .

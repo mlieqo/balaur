@@ -82,6 +82,8 @@ class PieceManager:
                     pieces_to_be_written.append(
                         self._pieces[piece_index].get_block_data()
                     )
+                    # drop ref count
+                    self._pieces[piece_index] = None
                     self._last_piece_index_written = piece_index
                 else:
                     if pieces_to_be_written:
