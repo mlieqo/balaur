@@ -5,4 +5,6 @@ Simple asynchronous bittorrent client written with asyncio.
 ## Usage
 
 To download a torrent file simply run
-```python -m balaur --torrent path_to_torrent_file.torrent --destination /path/to/destination```
+```bash
+python -m balaur --torrent path_to_torrent_file.torrent --destination /path/to/destination
+ ```
