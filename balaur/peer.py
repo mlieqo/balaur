@@ -16,6 +16,14 @@ import balaur.piece
 
 
 class PeerManager:
+    """
+    Manager class, responsible for obtaining peer data from trackers and spawning peer workers.
+    Tries to establish initial connection with peers and then tries to handshake them, if handshake
+    is successful, peer is moved to `self._active_peers`.
+
+    Download cycle is finished when `self._download_finished` future is done.
+    """
+
     MAX_CONNECTIONS = 50
     REFRESH_PEERS_DELAY = 120
 
@@ -25,13 +33,13 @@ class PeerManager:
         peer_id: bytes,
         piece_manager: balaur.piece.PieceManager,
     ):
-        self._peers: Optional[Set['Peer']] = None
-        self._active_peers = set()
         self._torrent = torrent
         self._peer_id = peer_id
         self._piece_manager = piece_manager
-        # single instance of parser is shared between all peers
         self._parser = balaur.message_parser.Parser()
+
+        self._peers: Optional[Set['Peer']] = None
+        self._active_peers = set()
         self._trackers: Optional[List[balaur.udp_tracker.UDPTracker]] = None
         self._workers: Optional[List[PeerWorker]] = None
         self._worker_tasks: Optional[List[asyncio.Task]] = None
@@ -79,19 +87,21 @@ class PeerManager:
     async def run(self) -> None:
         """
         Does initial handshake with `self._peers`, then schedules `self._refresh_peers_loop` to run
-        every `REFRESH_PEERS_DELAY` and runs all workers in background
+        every `REFRESH_PEERS_DELAY`, runs all workers in background and waits for `self._download_finished`
+        future.
         """
         await self._handshake_peers()
         self._peer_refresh_task = asyncio.create_task(self._refresh_peers_loop())
-        # worker_tasks = asyncio.create_task(asyncio.gather(*(worker.run() for worker in self._workers)))
         self._worker_tasks = [
             asyncio.create_task(worker.run()) for worker in self._workers
         ]
-        # all workers have returned so we can stop running all background tasks
         await self._download_finished
         await self._stop()
 
     async def _stop(self):
+        """
+        Cancel all of the background tasks.
+        """
         for worker_task in self._worker_tasks:
             worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -101,11 +111,12 @@ class PeerManager:
             await self._peer_refresh_task
 
     def _on_finished_download(self):
-        self._download_finished.set_result(True)
+        if not self._download_finished.done():
+            self._download_finished.set_result(True)
 
     async def _load_peers(self) -> None:
         """
-        Send UDP announce request and get information about the current peers
+        Send UDP announce request and get information about the current peers.
         """
         peer_sets = await asyncio.gather(
             *(self._get_peers(tracker) for tracker in self._trackers),
@@ -123,7 +134,7 @@ class PeerManager:
         try:
             peer_addresses = await tracker.get_peers()
         except Exception as e:
-            self._logger.error('Error loading peers from tracker = %s: %s', tracker, e)
+            self._logger.debug('Error loading peers from tracker = %s: %s', tracker, e)
         else:
             for ip, port in peer_addresses:
                 peers.add(
@@ -139,22 +150,14 @@ class PeerManager:
 
     async def _refresh_peers_loop(self) -> None:
         """
-        Downloads peer list and tries to handshake them every `REFRESH_PEERS_DELAY` seconds
+        Downloads peer list and tries to handshake them every `REFRESH_PEERS_DELAY` seconds.
         """
         while True:
             await asyncio.sleep(self.REFRESH_PEERS_DELAY)
             self._logger.info('Running refresh peers loop')
             await self._load_peers()
 
-            # we don't want to handshake also peers that we have already handshaked
-            # and are now in session with
-            peers_to_be_removed = set()
-            for peer in self._peers:
-                if peer in self._active_peers:
-                    self._logger.debug('Removing already handshaked peer = %s', peer)
-                    peers_to_be_removed.add(peer)
-            self._peers -= peers_to_be_removed
-
+            # TODO: we should not handshake peers that we are already in session with
             await self._handshake_peers()
 
     async def _handshake_peers(self) -> None:
@@ -272,9 +275,6 @@ class PeerWorker:
 
 
 class Peer:
-    """
-    Peer class implementation for communicating
-    """
 
     MINIMUM_HANDSHAKE_DELAY = 130
 
@@ -315,15 +315,20 @@ class Peer:
         return self._protocol.is_opened
 
     async def create_connection(self) -> None:
+        """
+        Establish TCP connection with peer.
+        """
         try:
             await self._protocol.connect()
         except balaur.protocol.PeerUnavailableError:
             return None
 
     async def make_handshake(self, peer_id: bytes, info_hash: bytes) -> None:
-
+        """
+        Send handshake message to the peer. Peers can also send a bitfield message right
+        after the handshake.
+        """
         handshake = balaur.bittorrent_message.Handshake.to_bytes(peer_id, info_hash)
-
         parsed_messages = await self._protocol.send_handshake(handshake)
 
         if parsed_messages is not None:
@@ -336,18 +341,22 @@ class Peer:
                     length=self._piece_manager.number_of_pieces
                 )
 
-    async def send_interested(self) -> bool:
+    async def send_interested(self) -> None:
+        """
+        Send interested message to the peer, and try to unchoke.
+        """
         parsed_message = await self._protocol.send_message(
             balaur.bittorrent_message.Interested.to_bytes()
         )
-
         # we don't really care for any other response than Unchoked
         if isinstance(parsed_message, balaur.bittorrent_message.Unchoke):
             self.choked = False
 
-        return self.choked
-
     async def download_piece(self):
+        """
+        Sends request message for `self._current_piece` that is acquired from
+        `self._piece_manager`.
+        """
         while not self._current_piece:
             self._current_piece = self._piece_manager.get_available_piece(
                 self._bitfield
@@ -356,6 +365,10 @@ class Peer:
             if self._current_piece is None:
                 # all pieces are currently taken or downloaded so we sleep
                 await asyncio.sleep(self.TRY_GET_PIECE_DELAY)
+
+        def return_piece():
+            self._piece_manager.return_piece_by_index(self._current_piece.index)
+            self._current_piece = None
 
         while self._current_piece:
             request_message = balaur.bittorrent_message.Request.to_bytes(
@@ -366,14 +379,11 @@ class Peer:
             try:
                 parsed_message = await self._protocol.send_message(request_message)
             except balaur.protocol.PeerUnavailableError:
-                self._piece_manager.return_piece_by_index(self._current_piece.index)
-                self._current_piece = None
+                return_piece()
                 raise
 
             if parsed_message is None:
-                # let piece manager know that piece is not being downloaded anymore
-                self._piece_manager.return_piece_by_index(self._current_piece.index)
-                self._current_piece = None
+                return_piece()
                 raise PeerResponseError
 
             if isinstance(parsed_message, balaur.bittorrent_message.Piece):
@@ -381,10 +391,7 @@ class Peer:
                     if self._piece_manager.validate_piece(self._current_piece):
                         self._current_piece = None
                     else:
-                        self._piece_manager.return_piece_by_index(
-                            self._current_piece.index
-                        )
-                        self._current_piece = None
+                        return_piece()
                         raise PeerResponseError
 
 
