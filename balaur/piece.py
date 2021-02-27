@@ -12,9 +12,6 @@ import balaur.writer
 import balaur.torrent
 
 
-logger = logwood.get_logger(__name__)
-
-
 class PieceManager:
     """
     Manager class that holds information about the individual pieces.
@@ -36,6 +33,7 @@ class PieceManager:
         # set of piece indexes that are currently being downloaded
         self._pieces_downloading: Set[int] = set()
         self._last_piece_index_written = -1
+        self._logger = logwood.get_logger(self.__class__.__name__)
 
     def _init_pieces(self) -> List['Piece']:
         """
@@ -74,7 +72,7 @@ class PieceManager:
         """
         data_hash = hashlib.sha1(piece.get_block_data()).digest()
         if is_valid := piece.hash == data_hash:
-            logger.debug('Downloaded piece n. %d', piece.index)
+            self._logger.debug('Downloaded piece n. %d', piece.index)
             self._pieces_downloading.remove(piece.index)
 
             pieces_to_be_written = []
